@@ -27,17 +27,22 @@
 //! Run it against independent test providers and return their observations.
 //!
 //! - read-mail(email, state) waits for the matching message and returns
-//!   {code?} and/or {link_token, link, state, server}. Decode fragment values
-//!   from the delivered link. Keep scenarios state-scoped.
+//!   {code?} and/or {link_token, link, state, server}, plus the message
+//!   {text}. Decode fragment values from the delivered link. Keep scenarios
+//!   state-scoped.
 //! - passkey-credential(public_key, origin, action, key, variant) uses a
 //!   virtual authenticator and returns the WebAuthn credential JSON, keeping
 //!   the authenticator state for each key. Variants are valid, wrong-origin,
-//!   wrong-rp, no-user-verification and bad-signature. For bad-signature,
-//!   alter the assertion while keeping the registered credential ID.
+//!   wrong-rp, no-user-verification, bad-signature, cross-origin and
+//!   top-origin. For bad-signature, alter the assertion while keeping the
+//!   registered credential ID. cross-origin sets crossOrigin: true in the
+//!   client data; top-origin adds only a topOrigin.
 //! - authorize(url, decision, variant, client_id, redirect_uri,
 //!   code_challenge, code_challenge_method, state, resource) drives a browser
 //!   sign-in and consent. Return actual redirect parameters {code, state, iss}
-//!   or {error, state}. Variants are valid, expired and passkey-login.
+//!   or {error, state}. Variants are valid, expired, passkey-login and
+//!   passkey-register. An optional account_token is entered on the page to
+//!   sign in to that account instead of using a new identity.
 //!   For expired, advance fixture time past code expiry after consent.
 //! - push-sink(kind) provisions an HTTPS receiver and returns {url, token?,
 //!   keys?}. For relay-encrypted and webpush supply the receiver's public keys.
@@ -46,6 +51,8 @@
 //!   Use lowercase header names. The plaintext is the exact UTF-8 payload.
 //!   Independently decrypt encrypted requests and verify the Web Push VAPID
 //!   signature against the server's advertised public key.
+//! - push-gone(url, status) makes that receiver answer every later push with
+//!   status (404 or 410), still capturing each request with {answered}.
 //! - expire-email(email, state), expire-passkey(challenge_id), and
 //!   expire-upload(embed_id) wait or advance test time past the relevant
 //!   expiry. Return an empty object.
@@ -56,5 +63,7 @@ mod auth;
 mod core;
 mod delivery;
 mod embeds;
+mod history;
+mod push;
 mod rooms;
 mod support;

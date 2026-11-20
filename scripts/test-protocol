@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Build aprond and run the black-box protocol suite against disposable daemons.
+#
+#   scripts/test-protocol                  # every protocol test
+#   scripts/test-protocol rooms::          # only tests whose name contains rooms::
+#   scripts/test-protocol --no-browser     # skip the tests that drive Chromium
+#
+# Needs Python 3 with `cryptography`, `curl`, and, unless --no-browser is
+# given, Chromium with a matching chromedriver. APRON_TEST_CHROME and
+# APRON_TEST_CHROMEDRIVER override where the fixture finds them.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+# Tests that use the passkey-credential, authorize, or open-email-link
+# fixture actions, all of which start Chromium. Keep in sync with
+# crates/server/tests/protocol/auth.rs.
+browser_tests=(
+  auth::passkey_registration_login_and_origin_bound_resume
+  auth::passkey_challenges_bind_connection_action_and_verification
+  auth::passkey_page_codes_are_action_specific_and_single_use
+  auth::passkey_page_addition_requires_the_proposing_account
+  auth::external_code_is_single_use_and_accepts_resume_without_origin_binding
+  auth::external_redemption_rejects_wrong_pkce_client_redirect_and_expired_code
+  auth::expired_email_tokens_and_passkey_challenges_are_denied
+  auth::delivered_email_link_opens_and_confirms_on_the_server_origin
+  auth::redeeming_on_a_signed_in_connection_adds_the_identity_to_that_account
+  auth::adding_an_identity_that_belongs_to_another_account_is_denied
+  auth::frame_client_data_is_denied_and_uses_up_the_ceremony
+  auth::a_disconnect_cancels_the_pending_ceremony
+  auth::a_malformed_credential_uses_up_the_ceremony
+)
+
+filters=()
+skips=()
+for arg in "$@"; do
+  case "$arg" in
+    --no-browser)
+      for name in "${browser_tests[@]}"; do skips+=(--skip "$name"); done
+      ;;
+    -h|--help)
+      sed -n '2,10s/^# \{0,1\}//p' "$0"
+      exit 0
+      ;;
+    *) filters+=("$arg") ;;
+  esac
+done
+
+cargo build -p aprond --locked
+exec python3 scripts/protocol-fixture.py run \
+  cargo test -p server --test protocol --locked ${filters[@]+"${filters[@]}"} -- \
+  --ignored --test-threads=1 ${skips[@]+"${skips[@]}"}

@@ -1,5 +1,25 @@
-//! Library entry point for the Apron server. Build the shared state and HTTP routes
-//! around a caller-supplied store and run until the daemon signals shutdown.
-//!
-//! Proposed: async fn serve(listener: TcpListener, config: ServerConfig, store: Arc<dyn Store>,
-//!     shutdown: CancellationToken) -> Result<(), ServeError>
+mod activity;
+mod auth;
+mod commands;
+mod dedup;
+mod delivery;
+mod dispatch;
+mod embeds;
+mod extensions;
+mod history;
+mod http;
+mod messages;
+mod policy;
+mod push;
+mod reactions;
+mod rooms;
+mod service;
+mod session;
+mod status;
+mod users;
+mod wire;
+mod ws;
+
+pub use auth::email::EmailConfig;
+pub use push::PushConfig;
+pub use service::{ServerConfig, serve};

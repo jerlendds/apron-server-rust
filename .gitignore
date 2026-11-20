@@ -1,2 +1,8 @@
 target/
 .env
+__pycache__/
+/apron.db*
+apron/
+PROTOCOL.md
+node_modules/
+conformance.json

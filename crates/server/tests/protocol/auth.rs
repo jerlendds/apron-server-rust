@@ -133,7 +133,7 @@ fn passkey_challenges_bind_connection_action_and_verification() {
         .error(DENIED);
 }
 
-fn email_address() -> String {
+pub(super) fn email_address() -> String {
     format!(
         "{}@{}",
         unique("apron"),
@@ -141,7 +141,7 @@ fn email_address() -> String {
     )
 }
 
-fn propose(peer: &mut Peer, email: &str, state: &str) -> Value {
+pub(super) fn propose(peer: &mut Peer, email: &str, state: &str) -> Value {
     assert_eq!(
         peer.auth(json!({"scheme":"email","email":email,"state":state}))
             .ok(),
@@ -150,7 +150,7 @@ fn propose(peer: &mut Peer, email: &str, state: &str) -> Value {
     control("read-mail", json!({"email":email,"state":state}))
 }
 
-fn approve(mail: &Value, state: &str, scheme: &str) -> Value {
+pub(super) fn approve(mail: &Value, state: &str, scheme: &str) -> Value {
     let token = mail["link_token"]
         .as_str()
         .or_else(|| mail["code"].as_str())
@@ -423,4 +423,349 @@ fn expired_email_tokens_and_passkey_challenges_are_denied() {
         json!({"challenge_id":begin["challenge_id"]}),
     );
     passkey.auth(finish).error(DENIED);
+}
+
+#[test]
+#[ignore = "requires email authentication, a test mail inbox, and a browser fixture"]
+fn delivered_email_link_opens_and_confirms_on_the_server_origin() {
+    let mut applicant = Peer::open();
+    let state = unique("email-browser");
+    let mail = propose(&mut applicant, &email_address(), &state);
+    let confirmed = control("open-email-link", json!({"link": mail["link"]}));
+    let mut resumed = Peer::open();
+    let token = string(&confirmed["token"]);
+    opaque(&resumed.auth(json!({"scheme":"token","token":token})).ok()["you"]["user_id"]);
+    applicant
+        .auth(approve(&mail, &state, "email"))
+        .error(DENIED);
+}
+
+#[test]
+#[ignore = "requires passkey page and a browser authorization fixture"]
+fn passkey_page_addition_requires_the_proposing_account() {
+    let mut owner = Peer::open();
+    let account = owner.guest();
+    let start = owner
+        .auth(json!({"scheme":"webauthn","action":"register","step":"begin"}))
+        .ok();
+    let url = string(&start["external"]["url"]);
+    let state = unique("passkey-addition");
+    let result = control(
+        "authorize",
+        json!({
+            "url":url,"decision":"allow","variant":"passkey-register","account_token":account["token"],
+            "client_id":CLIENT,"redirect_uri":REDIRECT,"code_challenge":CHALLENGE,
+            "code_challenge_method":"S256","state":state,"resource":fixture_origin()
+        }),
+    );
+    assert_eq!(result["state"], state);
+    assert_eq!(result["iss"], fixture_origin());
+    string(&result["code"]);
+    let mut finish = redemption("webauthn", &result["code"]);
+    finish["step"] = json!("finish");
+    finish["action"] = json!("register");
+    Peer::open().auth(finish.clone()).error(DENIED);
+    let added = owner.auth(finish.clone()).ok();
+    assert_eq!(added["you"]["user_id"], account["you"]["user_id"]);
+    owner.auth(finish).error(DENIED);
+}
+
+// --- email (§4.11) ------------------------------------------------------------
+
+fn server_address() -> String {
+    env::var("APRON_TEST_PUBLIC_WS").unwrap_or_else(|_| env::var("APRON_TEST_WS").unwrap())
+}
+
+/// Signs in a fresh connection with a new email account, and returns it.
+fn email_account(email: &str) -> (Peer, Value) {
+    let mut peer = Peer::open();
+    let state = unique("account");
+    let mail = propose(&mut peer, email, &state);
+    let result = peer.auth(approve(&mail, &state, "email")).ok();
+    (peer, result)
+}
+
+#[test]
+#[ignore = "requires email authentication and a test mail inbox"]
+fn a_proposal_reply_does_not_show_whether_the_address_has_an_account() {
+    let known = email_address();
+    email_account(&known);
+    let unknown = email_address();
+    let replies = [&known, &unknown].map(|email| {
+        let mut peer = Peer::open();
+        let state = unique("enumeration");
+        let exchange = peer.auth(json!({"scheme":"email","email":email,"state":state}));
+        let frame = exchange.frame.clone();
+        assert_eq!(exchange.ok(), json!({}));
+        // Mail goes out either way.
+        control("read-mail", json!({"email":email,"state":state}));
+        frame["result"].clone()
+    });
+    assert_eq!(replies[0], replies[1]);
+}
+
+#[test]
+#[ignore = "requires email authentication and a test mail inbox"]
+fn failed_approvals_from_any_connection_cancel_the_proposal() {
+    let mut proposer = Peer::open();
+    let state = unique("attempts");
+    let mail = propose(&mut proposer, &email_address(), &state);
+    let code = string(&mail["code"]).to_owned();
+    let wrong = if code == "000000" { "000001" } else { "000000" };
+    // Short codes work with the proposal's `state` on any connection, so
+    // failures count from anywhere.
+    for _ in 0..4 {
+        Peer::open()
+            .auth(json!({"scheme":"email","token":wrong,"state":state}))
+            .error(DENIED);
+    }
+    proposer
+        .auth(json!({"scheme":"email","token":code,"state":state}))
+        .error(DENIED);
+    Peer::open()
+        .auth(approve(&mail, &state, "email"))
+        .error(DENIED);
+}
+
+#[test]
+#[ignore = "requires email authentication and a test mail inbox"]
+fn proposal_state_is_limited_to_256_bytes() {
+    let mut peer = Peer::open();
+    let email = email_address();
+    peer.auth(json!({"scheme":"email","email":email,"state":"s".repeat(257)}))
+        .error(INVALID);
+    let state = "s".repeat(256);
+    let mail = propose(&mut peer, &email, &state);
+    assert_eq!(mail["state"], state.as_str());
+}
+
+#[test]
+#[ignore = "requires email authentication and a test mail inbox"]
+fn an_email_with_a_code_names_the_server_to_type_it_into() {
+    let mut peer = Peer::open();
+    let state = unique("names-server");
+    let mail = propose(&mut peer, &email_address(), &state);
+    let text = string(&mail["text"]);
+    let code = string(&mail["code"]);
+    let line = text
+        .lines()
+        .find(|line| line.contains(code))
+        .unwrap_or_else(|| panic!("no line with the code: {text}"));
+    assert!(
+        line.contains(&server_address()),
+        "the code's line names {}: {line}",
+        server_address()
+    );
+}
+
+#[test]
+#[ignore = "requires email authentication and a test mail inbox"]
+fn adding_an_address_that_belongs_to_another_account_is_denied() {
+    let email = email_address();
+    let (_, owner) = email_account(&email);
+    let mut other = Peer::open();
+    let other_id = other.guest()["you"]["user_id"].clone();
+    assert_ne!(other_id, owner["you"]["user_id"]);
+    let state = unique("taken");
+    let mail = propose(&mut other, &email, &state);
+    other.auth(approve(&mail, &state, "token")).error(DENIED);
+    // The address still signs in to its owner.
+    let mut again = Peer::open();
+    let state = unique("still-owner");
+    let mail = propose(&mut again, &email, &state);
+    assert_eq!(
+        again.auth(approve(&mail, &state, "email")).ok()["you"]["user_id"],
+        owner["you"]["user_id"]
+    );
+}
+
+// --- external sign-in (§4.12) ---------------------------------------------------
+
+fn authorize_as(url: &str, account_token: &str) -> Value {
+    let state = unique("oauth-account");
+    let result = control(
+        "authorize",
+        json!({"url":url,"decision":"allow","variant":"valid","account_token":account_token,
+        "client_id":CLIENT,"redirect_uri":REDIRECT,"code_challenge":CHALLENGE,
+        "code_challenge_method":"S256","state":state,"resource":fixture_origin()}),
+    );
+    assert_eq!(result["state"], state);
+    result
+}
+
+#[test]
+#[ignore = "requires external auth and browser authorization fixture"]
+fn redeeming_on_a_signed_in_connection_adds_the_identity_to_that_account() {
+    let mut peer = Peer::open();
+    let you = peer.guest()["you"].clone();
+    let url = external_url(&mut peer);
+    let code = authorize(&url, "allow", "valid")["code"].clone();
+    let added = peer.auth(redemption("external", &code)).ok();
+    assert_eq!(added["you"], you, "the same account");
+    assert!(added.get("token").is_none(), "an addition issues no token");
+    peer.call("me", json!({})).ok();
+}
+
+#[test]
+#[ignore = "requires external auth and browser authorization fixture"]
+fn adding_an_identity_that_belongs_to_another_account_is_denied() {
+    let mut owner = Peer::open();
+    let owner_auth = owner.guest();
+    let mut other = Peer::open();
+    let other_id = other.guest()["you"]["user_id"].clone();
+    let url = external_url(&mut other);
+    // The page signs in to the owner's account, so the code's identity is
+    // the owner's.
+    let code = authorize_as(&url, string(&owner_auth["token"]))["code"].clone();
+    other.auth(redemption("external", &code)).error(DENIED);
+    assert_eq!(
+        other.call("me", json!({})).ok()["you"]["user_id"],
+        other_id,
+        "the connection keeps its identity"
+    );
+    let code = authorize_as(&url, string(&owner_auth["token"]))["code"].clone();
+    assert_eq!(
+        Peer::open().auth(redemption("external", &code)).ok()["you"]["user_id"],
+        owner_auth["you"]["user_id"]
+    );
+}
+
+#[test]
+#[ignore = "requires external auth"]
+fn external_with_a_token_and_no_extension_is_denied() {
+    let mut peer = Peer::open();
+    peer.scheme("external");
+    peer.auth(json!({"scheme":"external","token":"anything"}))
+        .error(DENIED);
+}
+
+fn authorize_query(url: &str, redirect: &str) -> String {
+    let delimiter = if url.contains('?') { '&' } else { '?' };
+    format!(
+        "{url}{delimiter}response_type=code&client_id={CLIENT}&redirect_uri={redirect}&code_challenge={CHALLENGE}&code_challenge_method=S256&state={}&resource={}",
+        unique("page"),
+        fixture_origin()
+    )
+}
+
+fn assert_sign_in_headers(page: &Http) {
+    assert_eq!(page.header("Referrer-Policy"), Some("no-referrer"));
+    assert!(matches!(
+        page.header("Cross-Origin-Opener-Policy"),
+        None | Some("unsafe-none")
+    ));
+    let csp = page.header("Content-Security-Policy").unwrap_or_default();
+    assert!(
+        page.header("X-Frame-Options")
+            .is_some_and(|v| v.eq_ignore_ascii_case("deny"))
+            || csp.contains("frame-ancestors 'none'"),
+        "the page refuses to be framed"
+    );
+}
+
+#[test]
+#[ignore = "requires external auth, passkey page, and curl"]
+fn sign_in_pages_send_no_referrer_and_refuse_frames() {
+    let mut peer = Peer::open();
+    let url = external_url(&mut peer);
+    let page = http(
+        "GET",
+        &authorize_query(&url, "https%3A%2F%2Fclient.invalid%2Fcb"),
+        &[],
+        None,
+    );
+    assert_eq!(page.status, 200);
+    assert_sign_in_headers(&page);
+
+    peer.scheme("webauthn");
+    let begin = peer
+        .auth(json!({"scheme":"webauthn","action":"login","step":"begin"}))
+        .ok();
+    let passkey_url = string(&begin["external"]["url"]);
+    let page = http("GET", &authorize_query(passkey_url, REDIRECT), &[], None);
+    assert_eq!(page.status, 200);
+    assert_sign_in_headers(&page);
+}
+
+#[test]
+#[ignore = "requires external auth and curl"]
+fn consent_is_asked_at_each_sign_in() {
+    // §4.12.3 lets a user allow an https redirect_uri once for their
+    // account. This server does not remember consent: every sign-in shows
+    // the consent form and never redirects by itself.
+    let mut peer = Peer::open();
+    let url = external_url(&mut peer);
+    for redirect in [
+        "https%3A%2F%2Fclient.invalid%2Fcb",
+        "chat.apron.conformance%3A%2Fsigned-in",
+    ] {
+        for _ in 0..2 {
+            let page = http("GET", &authorize_query(&url, redirect), &[], None);
+            assert_eq!(page.status, 200);
+            assert!(page.header("Location").is_none());
+            let body = String::from_utf8_lossy(&page.body);
+            assert!(body.contains("value=\"allow\""), "{body}");
+        }
+    }
+}
+
+// --- passkeys (§4.10) -----------------------------------------------------------
+
+#[test]
+#[ignore = "requires direct WebAuthn and a virtual-authenticator fixture"]
+fn frame_client_data_is_denied_and_uses_up_the_ceremony() {
+    let mut owner = direct_peer();
+    owner.scheme("webauthn");
+    owner.guest();
+    for variant in ["cross-origin", "top-origin"] {
+        let begin = begin_passkey(&mut owner, "register");
+        let key = unique(variant);
+        owner
+            .auth(sign_passkey(&begin, "register", &key, variant))
+            .error(DENIED);
+        owner
+            .auth(sign_passkey(&begin, "register", &key, "valid"))
+            .error(DENIED);
+    }
+}
+
+#[test]
+#[ignore = "requires direct WebAuthn"]
+fn register_begin_uses_the_requested_name() {
+    let mut peer = direct_peer();
+    peer.scheme("webauthn");
+    let begin = peer
+        .auth(json!({"scheme":"webauthn","action":"register","step":"begin","name":"Ada Fixture"}))
+        .ok();
+    let user = &begin["public_key"]["user"];
+    assert_eq!(user["name"], "Ada Fixture");
+    assert_eq!(user["displayName"], "Ada Fixture");
+}
+
+#[test]
+#[ignore = "requires direct WebAuthn and a virtual-authenticator fixture"]
+fn a_disconnect_cancels_the_pending_ceremony() {
+    let mut owner = direct_peer();
+    let auth = owner.guest();
+    let begin = begin_passkey(&mut owner, "register");
+    let finish = sign_passkey(&begin, "register", &unique("disconnect"), "valid");
+    owner.close();
+    let mut back = direct_peer();
+    back.auth(json!({"scheme":"token","token":string(&auth["token"])}))
+        .ok();
+    back.auth(finish).error(DENIED);
+}
+
+#[test]
+#[ignore = "requires direct WebAuthn and a virtual-authenticator fixture"]
+fn a_malformed_credential_uses_up_the_ceremony() {
+    let mut owner = direct_peer();
+    owner.guest();
+    let begin = begin_passkey(&mut owner, "register");
+    let key = unique("malformed");
+    let mut malformed = sign_passkey(&begin, "register", &key, "valid");
+    let valid = malformed.clone();
+    malformed["credential"] = json!({"id":"not-a-credential","response":{}});
+    owner.auth(malformed).error(DENIED);
+    owner.auth(valid).error(DENIED);
 }

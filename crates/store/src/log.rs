@@ -1,7 +1,34 @@
-//! Allocate positive server-wide log IDs below 2^53, using a high-water mark persisted
-//! with each write. Index a record by each affected room without cloning its identity.
-//!
-//! Proposed: fn next_log_id(now_ms: u64, previous: Option<LogId>) -> Result<LogId, StoreError>
-//! Proposed: async fn allocate(tx: &mut dyn WriteTx, now_ms: u64) -> Result<LogId, StoreError>
-//! Proposed: async fn append(tx: &mut dyn WriteTx, record: LogRecord,
-//!     rooms: &[RoomId]) -> Result<(), StoreError>
+use crate::{Record, State};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+impl State {
+    pub fn next_log_id(&mut self) -> Option<u64> {
+        let id = epoch_millis().max(self.watermark.checked_add(1)?);
+        if id >= (1 << 53) {
+            return None;
+        }
+        self.watermark = id;
+        Some(id)
+    }
+
+    pub fn log(&mut self, id: u64, kind: &str, rooms: Vec<String>, value: serde_json::Value) {
+        for room in &rooms {
+            self.room_log.entry(room.clone()).or_default().insert(id);
+        }
+        self.records.insert(
+            id,
+            Record {
+                kind: kind.into(),
+                rooms,
+                value,
+            },
+        );
+    }
+}

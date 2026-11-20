@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    name: fmt, clippy, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  protocol:
+    name: protocol suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: python -m pip install cryptography
+      - uses: browser-actions/setup-chrome@v1
+        id: chrome
+        with:
+          chrome-version: stable
+          install-chromedriver: true
+      # Every provider (mail inbox, push receiver, OAuth/passkey browser) is a
+      # local fixture, so the whole suite runs here, browser tests included.
+      - run: scripts/test-protocol
+        env:
+          APRON_TEST_CHROME: ${{ steps.chrome.outputs.chrome-path }}
+          APRON_TEST_CHROMEDRIVER: ${{ steps.chrome.outputs.chromedriver-path }}
+
+  conformance:
+    name: apron conformance
+    runs-on: ubuntu-latest
+    steps:
+      # scripts/conformance fetches shazow/apron into the git-ignored apron/,
+      # at the commit it pins.
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      # Playwright with Chromium, for conform.py's passkey portal.
+      - name: Install Playwright
+        run: |
+          npm install --prefix "$RUNNER_TEMP/playwright" playwright
+          "$RUNNER_TEMP/playwright/node_modules/.bin/playwright" install --with-deps chromium
+          echo "NODE_PATH=$RUNNER_TEMP/playwright/node_modules" >> "$GITHUB_ENV"
+      - run: scripts/conformance
+        env:
+          APRON_CONFORMANCE_JSON: ${{ runner.temp }}/conformance.json
+          APRON_REQUIRE_PORTAL: "1"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-report
+          path: ${{ runner.temp }}/conformance.json
+          if-no-files-found: ignore

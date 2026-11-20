@@ -1,5 +1,13 @@
-//! Describe future versioned Turso schema migrations for log state, projections,
-//! room indexes, one-time credentials, grants, and retry results. Check the schema
-//! version before accepting traffic.
-//!
-//! Proposed: async fn migrate(database: &Database) -> Result<(), StoreError>
+pub(crate) async fn apply(connection: &turso::Connection) -> Result<(), turso::Error> {
+    connection.execute(
+            "CREATE TABLE IF NOT EXISTS apron_state (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)",
+            (),
+        ).await?;
+    connection
+        .execute(
+            "CREATE TABLE IF NOT EXISTS apron_log (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)",
+            (),
+        )
+        .await?;
+    Ok(())
+}

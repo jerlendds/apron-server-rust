@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Run apron's conformance suite (tests/conformance/conform.py) against a fresh aprond.
+#
+#   scripts/conformance                       # every check
+#   scripts/conformance --only 'core.*'       # extra arguments go to conform.py
+#
+# The protocol repository is checked out into ./apron (git-ignored) when it is
+# missing, at the commit pinned below. APRON_REPO and APRON_REF (a commit,
+# branch, or tag) override what to fetch. An existing checkout is used as it
+# is, with a warning when it isn't at APRON_REF.
+#
+# The sign-in checks run through the passkey portal when Node.js can load
+# Playwright (set NODE_PATH to its node_modules if needed); without it,
+# conform.py skips them. With the portal, a check that skips because the portal
+# could not sign in fails the run, so a broken browser can't hide those checks.
+# APRON_REQUIRE_PORTAL=1 also fails the run when Playwright is missing (CI sets
+# it). APRON_CONFORMANCE_JSON sets the report path (default: conformance.json).
+# Needs uv, cargo, git, and curl.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+# The protocol version this server is tested against. Bump it on purpose, after
+# the suite passes against the new commit.
+pin=096e2fe04ce7d3eaabf0cc748285abef5a694ae3
+repo="${APRON_REPO:-https://github.com/shazow/apron.git}"
+ref="${APRON_REF:-$pin}"
+report="${APRON_CONFORMANCE_JSON:-$root/conformance.json}"
+
+if [[ ! -d apron/.git ]]; then
+  git init -q apron
+  git -C apron remote add origin "$repo"
+  git -C apron fetch -q --depth 1 origin "$ref"
+  git -C apron checkout -q --detach FETCH_HEAD
+elif want="$(git -C apron rev-parse -q --verify "$ref^{commit}" 2>/dev/null)" \
+  && [[ "$want" != "$(git -C apron rev-parse HEAD)" ]]; then
+  echo "warning: apron/ is not at APRON_REF ($ref): git -C apron checkout $ref" >&2
+elif [[ -z "${want:-}" ]]; then
+  echo "warning: apron/ does not have APRON_REF ($ref): git -C apron fetch origin" >&2
+fi
+echo "apron protocol: $(git -C apron rev-parse --short HEAD) ($(git -C apron log -1 --format=%s))"
+
+cargo build --locked -p aprond
+port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+origin="http://localhost:$port"
+work="$(mktemp -d)"
+
+# `true` as the mail transport turns on email sign-in and discards the mail;
+# conform.py checks proposals but never completes an email sign-in.
+# External sign-in stays off: without an identity provider behind it, the
+# built-in /oauth/authorize page makes a new identity at each sign-in, so the
+# external.* checks can't sign in as the same person twice. They skip.
+target/debug/aprond --memory --listen "127.0.0.1:$port" --http-origin "$origin" \
+  --passkey-auth --mail-command true >"$work/aprond.log" 2>&1 &
+server=$!
+trap 'kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true' EXIT
+
+for _ in $(seq 50); do
+  curl -fsS "$origin/health" >/dev/null 2>&1 && break
+  kill -0 "$server" 2>/dev/null || { cat "$work/aprond.log"; exit 1; }
+  sleep 0.1
+done
+
+portal=()
+if node -e 'require("playwright")' >/dev/null 2>&1; then
+  portal=(--portal "node $root/apron/tests/conformance/portals/passkey.cjs")
+elif [[ "${APRON_REQUIRE_PORTAL:-}" == 1 ]]; then
+  echo "Playwright not found, and APRON_REQUIRE_PORTAL=1: set NODE_PATH to its node_modules" >&2
+  exit 1
+else
+  echo "Playwright not found: the sign-in checks will skip" >&2
+fi
+
+status=0
+(cd apron && uv run tests/conformance/conform.py "ws://localhost:$port/ws" \
+  "${portal[@]}" --json "$report" "$@") || status=$?
+
+# conform.py skips, rather than fails, the checks whose sign-in the portal could
+# not finish. With a portal, such a skip means the browser broke: fail on it.
+if [[ ${#portal[@]} -gt 0 && -f "$report" ]]; then
+  python3 - "$report" <<'PY' || status=1
+import json, sys
+skips = [r["id"] for r in json.load(open(sys.argv[1]))["results"]
+         if r["status"] == "SKIP" and "portal" in r["message"]]
+if skips:
+    sys.exit("the passkey portal could not sign in, so these checks skipped: " + ", ".join(skips))
+PY
+fi
+
+if [[ $status -ne 0 ]]; then
+  echo "--- aprond log (last 50 lines) ---"
+  tail -n 50 "$work/aprond.log"
+fi
+exit "$status"

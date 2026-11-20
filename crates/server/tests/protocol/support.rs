@@ -192,6 +192,31 @@ impl Peer {
         }
     }
 
+    /// Sends `text` and expects the server to close the connection without
+    /// replying to `id`. The send itself may fail once the server hangs up.
+    pub fn expect_closed_after(mut self, id: &str, text: String) {
+        if self.ws.send(Message::Text(text.into())).is_err() {
+            return;
+        }
+        loop {
+            match self.ws.read() {
+                Ok(Message::Text(text)) => {
+                    let frame: Value = serde_json::from_str(&text).expect("invalid server JSON");
+                    assert_ne!(frame["id"], id, "server handled the frame: {frame}");
+                    self.inbox.push(frame);
+                }
+                Ok(Message::Close(_)) => return,
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(error))
+                    if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
+                {
+                    panic!("connection stayed open; inbox: {:?}", self.inbox)
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
     pub fn reply(&mut self, id: &str) -> Exchange {
         let mut before = Vec::new();
         for _ in 0..256 {
